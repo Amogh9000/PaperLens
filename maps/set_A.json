@@ -1,0 +1,13 @@
+{
+  "sheet_version": "v1-setA",
+  "subjects": ["PYTHON", "DATA ANALYSIS", "MySQL", "POWER BI", "Adv STATS"],
+  "questions_per_subject": 20,
+  "options": ["A", "B", "C", "D"],
+  "answer_key": {
+  "PYTHON": ["A","C","C","C","C","A","C","C","B","C","A","A","D","A","B","D","C","D","A","B"],
+  "DATA ANALYSIS":["A","D","B","A","C","B","A","B","D","C","C","A","B","C","A","B","D","B","A","B"],
+  "MySQL": ["C","C","C","B","B","A","C","B","D","A","C","B","C","C","A","B","B","A","A","B"],
+  "POWER BI": ["B","C","C","B","C","B","B","C","C","B","B","B","D","B","A","B","B","B","B","B"],
+  "Adv STATS": ["A","B","C","B","C","B","B","B","A","B","C","B","C","B","B","B","C","A","B","C"]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "sheet_version": "v1",
+  "subjects": ["Math", "English", "Science", "Reasoning", "GK"],
+  "questions_per_subject": 20,
+  "options": ["A", "B", "C", "D"],
+  "answer_key": {
+    "Math":    ["A","B","C","D","A","B","C","D","A","B","C","D","A","B","C","D","A","B","C","D"],
+    "English": ["B","C","D","A","B","C","D","A","B","C","D","A","B","C","D","A","B","C","D","A"],
+    "Science": ["C","D","A","B","C","D","A","B","C","D","A","B","C","D","A","B","C","D","A","B"],
+    "Reasoning":["D","A","B","C","D","A","B","C","D","A","B","C","D","A","B","C","D","A","B","C"],
+    "GK":      ["A","A","B","B","C","C","D","D","A","B","C","D","A","B","C","D","A","B","C","D"]
+  }
+}
