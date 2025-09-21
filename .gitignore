@@ -118,7 +118,9 @@ celerybeat.pid
 
 # SageMath parsed files
 *.sage.py
-
+# Virtual env
+.venv/
+venv/
 # Environments
 .env
 .venv
@@ -200,4 +202,11 @@ output/
 .Spotlight-V100
 .Trashes
 ehthumbs.db
+Thumbs.db
+
+# Streamlit cache
+.streamlit/
+
+# OS
+.DS_Store
 Thumbs.db
