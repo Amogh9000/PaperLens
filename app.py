@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import cv2
 import time
 import io
 import base64
@@ -215,8 +216,6 @@ def get_cached_annotated_image(result: dict):
 def init_state():
     if 'demo_mode' not in st.session_state:
         st.session_state.demo_mode = False
-    if 'dark_mode' not in st.session_state:
-        st.session_state.dark_mode = False
     if 'uploaded_file' not in st.session_state:
         st.session_state.uploaded_file = None
     if 'current_result' not in st.session_state:
@@ -227,14 +226,36 @@ def init_state():
         st.session_state.batch_results = []
     if 'answer_key' not in st.session_state:
         st.session_state.answer_key = None
+    # Flags to safely clear uploaders before widget instantiation
+    if 'clear_omr_upl' not in st.session_state:
+        st.session_state.clear_omr_upl = False
+    if 'clear_ak_upl' not in st.session_state:
+        st.session_state.clear_ak_upl = False
+    if 'answer_key_data' not in st.session_state:
+        st.session_state.answer_key_data = None  # full dict from uploaded JSON/Excel
+    if 'answer_key_set' not in st.session_state:
+        st.session_state.answer_key_set = None  # set name like set_1 / set_2
+    if 'local_answer_key_data' not in st.session_state:
+        st.session_state.local_answer_key_data = None  # discovered from disk
+    if 'use_local_keys' not in st.session_state:
+        st.session_state.use_local_keys = True
+    if 'local_key_sources' not in st.session_state:
+        st.session_state.local_key_sources = {}  # e.g., {"A": "answer_key_set1.xlsx", "B": "answer_key_set2.xlsx"}
+    if 'uploaded_key_source' not in st.session_state:
+        st.session_state.uploaded_key_source = None  # filename of uploaded key
     if 'current_overlay' not in st.session_state:
         st.session_state.current_overlay = None
     if 'key_set' not in st.session_state:
         st.session_state.key_set = 'A'
     if 'has_real_data' not in st.session_state:
         st.session_state.has_real_data = False  # becomes True after a successful DB save
+    if 'sample_image' not in st.session_state:
+        st.session_state.sample_image = None  # path to Img1/2/20
+    if 'detailed_results' not in st.session_state:
+        st.session_state.detailed_results = None
 
 def load_default_key():
+    # Keep old fallback for mock mode; real flow uses uploaded key
     if st.session_state.answer_key is None:
         key_file = f"set_{st.session_state.key_set}.json"
         key_path = os.path.join(os.path.dirname(__file__), 'maps', key_file)
@@ -246,6 +267,123 @@ def load_default_key():
                 "subjects": SUBJECTS,
                 "answer_key": {s: ["A"]*20 for s in SUBJECTS}
             }
+
+def _normalize_key_sets(data: dict) -> dict:
+    """Return a dict of sets with normalized names and safe access aliases.
+    Accepts structures like {"set_1": {...}, "set_2": {...}} or {"A": {...}, "B": {...}}.
+    Produces keys for both styles so UI can choose A/B but backend can still resolve.
+    """
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    # If it's an answer-key root with sets inside
+    for k, v in data.items():
+        lk = str(k).strip().lower()
+        if lk in ("a", "set_a", "set 1", "set_1", "1", "set1"):
+            out["A"] = v; out["set_1"] = v
+        elif lk in ("b", "set_b", "set 2", "set_2", "2", "set2"):
+            out["B"] = v; out["set_2"] = v
+        else:
+            # keep original
+            out[k] = v
+    # If we ended up with only one set but not aliased, keep as-is
+    return out
+
+def _discover_local_answer_keys() -> dict:
+    """Look for answer keys in the project directory.
+    Supports:
+      - answer_key.json (with sets)
+      - answer_key_set1.xlsx and/or answer_key_set2.xlsx (each sheet with columns question/answer)
+    Returns a normalized dict with keys like A/B and set_1/set_2.
+    """
+    base = os.path.dirname(__file__)
+    # JSON first
+    json_path = os.path.join(base, 'answer_key.json')
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            norm = _normalize_key_sets(data)
+            # Record sources
+            try:
+                st.session_state.local_key_sources = {}
+                if 'A' in norm or 'set_1' in norm:
+                    st.session_state.local_key_sources['A'] = f"answer_key.json -> {'A' if 'A' in norm else 'set_1'}"
+                if 'B' in norm or 'set_2' in norm:
+                    st.session_state.local_key_sources['B'] = f"answer_key.json -> {'B' if 'B' in norm else 'set_2'}"
+            except Exception:
+                pass
+            return norm
+        except Exception:
+            pass
+    # Excel split files
+    def _load_excel_to_map(xlsx_path: str) -> dict:
+        try:
+            xls = pd.ExcelFile(xlsx_path)
+            # take first sheet
+            sheet = xls.sheet_names[0]
+            df = xls.parse(sheet)
+            cols = {c.lower(): c for c in df.columns}
+            qcol = cols.get('question') or cols.get('q') or df.columns[0]
+            acol = cols.get('answer') or cols.get('ans') or df.columns[1]
+            m = {}
+            for _, row in df.iterrows():
+                if pd.notna(row[qcol]) and pd.notna(row[acol]):
+                    q = str(int(row[qcol]))
+                    a = str(row[acol]).strip().lower()
+                    m[q] = a
+            return m
+        except Exception:
+            return {}
+    set_map: dict = {}
+    set1 = os.path.join(base, 'answer_key_set1.xlsx')
+    set2 = os.path.join(base, 'answer_key_set2.xlsx')
+    if os.path.exists(set1):
+        m1 = _load_excel_to_map(set1)
+        if m1:
+            set_map['A'] = m1; set_map['set_1'] = m1
+            try:
+                st.session_state.local_key_sources['A'] = 'answer_key_set1.xlsx'
+            except Exception:
+                pass
+    if os.path.exists(set2):
+        m2 = _load_excel_to_map(set2)
+        if m2:
+            set_map['B'] = m2; set_map['set_2'] = m2
+            try:
+                st.session_state.local_key_sources['B'] = 'answer_key_set2.xlsx'
+            except Exception:
+                pass
+    return set_map
+
+def _load_answer_key_from_upload(file) -> dict:
+    """Load answer key from JSON or Excel into a dict with set names.
+    JSON format: {"set_1": {"1": "a", ...}, "set_2": {...}}
+    Excel format: expects columns like [question, answer] for each sheet or a single sheet; two files for set1/set2 also supported.
+    """
+    import io
+    name = getattr(file, 'name', 'uploaded')
+    if name.lower().endswith('.json'):
+        return json.loads(file.getvalue().decode('utf-8'))
+    # Excel: read with pandas
+    xls = pd.ExcelFile(file)
+    data = {}
+    # Prefer sheets named set_1/set_2; else first two sheets
+    for sheet in xls.sheet_names:
+        df = xls.parse(sheet)
+        # find columns heuristically
+        cols = {c.lower(): c for c in df.columns}
+        qcol = cols.get('question') or cols.get('q') or df.columns[0]
+        acol = cols.get('answer') or cols.get('ans') or df.columns[1]
+        mapping = {}
+        for _, row in df.iterrows():
+            q = str(int(row[qcol])) if pd.notna(row[qcol]) else None
+            a = str(row[acol]).strip().lower() if pd.notna(row[acol]) else ''
+            if q:
+                mapping[q] = a
+        set_name = sheet if sheet else 'set_1'
+        data[set_name] = mapping
+    return data
 
 def get_grade(percentage):
     if percentage >= 90:
@@ -264,6 +402,9 @@ def get_grade(percentage):
 def main():
     init_state()
     load_default_key()
+    # Discover local keys once per session
+    if st.session_state.local_answer_key_data is None:
+        st.session_state.local_answer_key_data = _discover_local_answer_keys()
 
     # Header
     st.markdown("""
@@ -273,78 +414,10 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    ctrl1, ctrl2, _ = st.columns([1,1,3])
+    ctrl1, _ = st.columns([1,5])
     with ctrl1:
         st.session_state.demo_mode = st.toggle("Demo Mode", value=st.session_state.demo_mode, help="View sample results and dashboard without uploading a file")
-    with ctrl2:
-        st.session_state.dark_mode = st.toggle("Dark Mode", value=st.session_state.dark_mode, help="Switch between light and dark themes")
 
-    # Robust dark mode CSS override
-    if st.session_state.dark_mode:
-        st.markdown("""
-        <style>
-        :root {
-            --bg: #0b1221;
-            --card: #0f172a;
-            --muted: #334155;
-            --accent: #60A5FA;
-            --accent-600: #3B82F6;
-            --success: #22C55E; --warning: #F59E0B; --danger: #EF4444;
-            --text: #E5E7EB; --subtext: #94A3B8;
-        }
-        body, [data-testid="stAppViewContainer"], .block-container {
-            background: var(--bg) !important;
-            color: var(--text) !important;
-        }
-        h1, h2, h3, h4, h5, h6, p, span, div, label, li, code, kbd, pre {
-            color: var(--text) !important;
-        }
-        .stCaption, .st-emotion-cache-10trblm, .st-emotion-cache-ur2l3v {
-            color: var(--subtext) !important;
-        }
-        .card, .subject-card, .stat-card, .topbar {
-            background: var(--card) !important;
-            border-color: var(--muted) !important;
-            color: var(--text) !important;
-        }
-        [data-testid="stSidebar"], [data-testid="stSidebar"] * {
-            background: var(--card) !important;
-            color: var(--text) !important;
-        }
-        [role="tablist"] { border-bottom: 1px solid var(--muted) !important; }
-        [role="tab"] { color: var(--subtext) !important; }
-        [role="tab"][aria-selected="true"] { color: var(--text) !important; border-bottom: 2px solid var(--accent) !important; }
-        [data-testid="stFileUploaderDropzone"] {
-            background: var(--card) !important;
-            border: 1px dashed var(--muted) !important;
-            color: var(--subtext) !important;
-        }
-        [data-testid="stFileUploader"] * { color: var(--text) !important; }
-        input, textarea, select {
-            background: var(--card) !important;
-            color: var(--text) !important;
-            border-color: var(--muted) !important;
-        }
-        .stDataFrame, .stDataFrame div, .stDataFrame th, .stDataFrame td {
-            color: var(--text) !important;
-            background: var(--card) !important;
-            border-color: var(--muted) !important;
-        }
-        .stAlert {
-            background: var(--card) !important;
-            border: 1px solid var(--muted) !important;
-            border-left: 4px solid var(--accent) !important;
-            color: var(--text) !important;
-        }
-        .stButton > button {
-            background: var(--accent) !important;
-            color: #fff !important;
-            border-radius: 10px !important;
-            border: 1px solid var(--accent-600) !important;
-        }
-        .stButton > button:hover { background: var(--accent-600) !important; }
-        </style>
-        """, unsafe_allow_html=True)
 
     tab_upload, tab_results, tab_review, tab_dash = st.tabs(["Upload", "Results", "Review", "Dashboard"])
 
@@ -360,31 +433,64 @@ def main():
 def upload_tab():
     st.header("Upload OMR Sheet")
 
-    # Key Set selector
+    # Key Set selector (drives grading set for current key source)
     col_sel, _ = st.columns([1,3])
     with col_sel:
-        new_set = st.selectbox("Answer Key Set", options=["A","B"], index=0 if st.session_state.key_set=='A' else 1, help="Choose the sheet set to score against")
-        if new_set != st.session_state.key_set:
-            st.session_state.key_set = new_set
-            st.session_state.answer_key = None
-            load_default_key()
+        # Always show A/B; we’ll warn if the chosen set isn’t available
+        default_idx = 0 if (st.session_state.answer_key_set or "A") == "A" else 1
+        new_set = st.selectbox("Answer Key Set", options=["A","B"], index=default_idx, help="Choose the sheet set to score against")
+        st.session_state.answer_key_set = new_set
 
+    # Minimal uploader (browse only look & feel)
     st.markdown("""
-    <div class="card">
-      <div class="upload-section">
-        <p>Drag and drop OMR image (PNG/JPG) or PDF, or click to browse.</p>
-      </div>
-    </div>
+    <style>
+    /* Tweak the uploader to look like a simple button and remove dashed box */
+    [data-testid="stFileUploaderDropzone"] {
+        border: none !important;
+        background: transparent !important;
+        padding: 0 !important;
+    }
+    [data-testid="stFileUploader"] button {
+        background: var(--accent) !important;
+        color: #fff !important;
+        border: 1px solid var(--accent-600) !important;
+        border-radius: 10px !important;
+        padding: 0.6rem 1rem !important;
+    }
+    [data-testid="stFileUploader"] div div div { display: none !important; } /* hide helper text */
+    </style>
     """, unsafe_allow_html=True)
+
+    # If last run asked to clear the OMR uploader, do it BEFORE creating the widget
+    if st.session_state.clear_omr_upl:
+        if 'omr_upl' in st.session_state:
+            del st.session_state['omr_upl']
+        st.session_state.clear_omr_upl = False
 
     uploaded_file = st.file_uploader(
         "Choose an OMR sheet file",
         type=["png", "jpg", "jpeg", "pdf"],
-        help="Supported formats: PNG, JPG, JPEG, PDF. Max size: 10MB"
+        help="Supported formats: PNG, JPG, JPEG, PDF. Max size: 10MB",
+        key="omr_upl"
     )
-
-    if uploaded_file:
+    if uploaded_file is not None:
         st.session_state.uploaded_file = uploaded_file
+        st.session_state.has_real_data = True
+        c1, c2 = st.columns([4,1])
+        with c1:
+            st.caption(f"File: {uploaded_file.name}")
+        with c2:
+            if st.button("✖ Remove", key="remove_omr_file"):
+                # Set flag to clear uploader key on next run
+                st.session_state.clear_omr_upl = True
+                st.session_state.uploaded_file = None
+                st.session_state.current_result = None
+                st.session_state.review_images = None
+                try:
+                    st.rerun()
+                except Exception:
+                    import streamlit as _st
+                    _st.experimental_rerun()
         col1, col2 = st.columns([1, 2])
         with col1:
             st.markdown("**File**")
@@ -400,6 +506,63 @@ def upload_tab():
     </div>
     """, unsafe_allow_html=True)
 
+    # Answer key source
+    ak_src1, ak_src2 = st.columns([2,2])
+    with ak_src1:
+        st.session_state.use_local_keys = st.toggle("Use local answer keys from project", value=bool(st.session_state.local_answer_key_data))
+        if st.session_state.use_local_keys and st.session_state.local_answer_key_data:
+            st.session_state.answer_key_data = st.session_state.local_answer_key_data
+            keys = st.session_state.answer_key_data.keys()
+            has_A = ("A" in keys) or ("set_1" in keys)
+            has_B = ("B" in keys) or ("set_2" in keys)
+            found = ", ".join([s for s, ok in (("A",has_A),("B",has_B)) if ok]) or "None"
+            st.caption(f"Local keys found: {found}")
+        else:
+            st.info("Local keys disabled or not found. Use Upload on the right.")
+    with ak_src2:
+        st.markdown("Upload Answer Key (JSON or Excel)")
+        # If last run asked to clear the Answer Key uploader, do it BEFORE creating the widget
+        if st.session_state.clear_ak_upl and 'ak_upl' in st.session_state:
+            del st.session_state['ak_upl']
+            st.session_state.clear_ak_upl = False
+        ak_file = st.file_uploader("Answer Key", type=["json","xlsx","xls"], key="ak_upl")
+        if ak_file is not None:
+            try:
+                st.session_state.answer_key_data = _normalize_key_sets(_load_answer_key_from_upload(ak_file))
+                # Update selected set to A if available, else B/None
+                keys = st.session_state.answer_key_data.keys()
+                if ("A" in keys) or ("set_1" in keys):
+                    st.session_state.answer_key_set = "A"
+                elif ("B" in keys) or ("set_2" in keys):
+                    st.session_state.answer_key_set = "B"
+                else:
+                    st.session_state.answer_key_set = None
+                st.session_state.uploaded_key_source = getattr(ak_file, 'name', 'uploaded')
+                # Show name and provide remove button
+                c1, c2 = st.columns([4,1])
+                with c1:
+                    st.success("Answer key loaded.")
+                    st.caption(f"File: {st.session_state.uploaded_key_source}")
+                with c2:
+                    if st.button("✖ Remove", key="remove_key_file"):
+                        # Set flag to clear uploader key on next run
+                        st.session_state.clear_ak_upl = True
+                        st.session_state.answer_key_data = None
+                        st.session_state.uploaded_key_source = None
+                        try:
+                            st.rerun()
+                        except Exception:
+                            import streamlit as _st
+                            _st.experimental_rerun()
+            except Exception as e:
+                st.error(f"Failed to load answer key: {e}")
+
+    st.markdown("""
+    <div class="card" style="margin-top: .5rem"> 
+      <h3 style="margin:0 0 .5rem 0">Run</h3>
+    </div>
+    """, unsafe_allow_html=True)
+
     run_col, demo_col2 = st.columns([2, 1])
     with run_col:
         if st.button("Run Evaluation", type="primary"):
@@ -411,8 +574,24 @@ def upload_tab():
             st.session_state.has_real_data = False
             st.success("Loaded demo result.")
 
+    # Show which answer key file is in use and warn if missing
+    if st.session_state.answer_key_data and st.session_state.answer_key_set:
+        src_hint = None
+        if st.session_state.use_local_keys and st.session_state.local_key_sources:
+            src_hint = st.session_state.local_key_sources.get(st.session_state.answer_key_set)
+        elif st.session_state.uploaded_key_source:
+            src_hint = f"Uploaded: {st.session_state.uploaded_key_source}"
+        if src_hint:
+            st.caption(f"Using key set {st.session_state.answer_key_set} from {src_hint}")
+        # Warn if selected set not present in keys
+        keys = st.session_state.answer_key_data.keys()
+        sel = st.session_state.answer_key_set
+        has_sel = (sel in keys) or (sel == 'A' and 'set_1' in keys) or (sel == 'B' and 'set_2' in keys)
+        if not has_sel:
+            st.warning(f"Key set '{sel}' not found in the current answer key source. Add it to answer_key.json (as '{'set_1' if sel=='A' else 'set_2'}' or '{sel}') or upload a file that contains it.")
+
 def evaluate_omr_sheet():
-    """Simulate OMR evaluation process"""
+    """Run OMR evaluation using the new backend if answer key is provided; otherwise fallback to demo."""
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -433,31 +612,128 @@ def evaluate_omr_sheet():
     status_text.text("Evaluation completed!")
 
     # Demo vs real engine path
-    if st.session_state.demo_mode or not st.session_state.uploaded_file:
+    using_uploaded = st.session_state.uploaded_file is not None
+    if st.session_state.demo_mode or not using_uploaded or not st.session_state.answer_key_data or not st.session_state.answer_key_set:
         st.session_state.current_result = make_single("DEMO-UPLOAD")
         st.session_state.current_overlay = None
         # In demo flow, do not mark as real data
         st.session_state.has_real_data = False
     else:
         try:
-            file_bytes = st.session_state.uploaded_file.getvalue()
-            res = engine.evaluate_omr(file_bytes, st.session_state.answer_key)
+            # Load image from upload only (support image or PDF)
+            up = st.session_state.uploaded_file
+            data = up.getvalue()
+            name = getattr(up, 'name', '').lower()
+            img = None
+            if name.endswith('.pdf'):
+                try:
+                    import fitz  # PyMuPDF
+                    doc = fitz.open(stream=data, filetype='pdf')
+                    if doc.page_count == 0:
+                        raise ValueError('Empty PDF')
+                    page = doc.load_page(0)
+                    zoom = 200/72.0
+                    mat = fitz.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=mat, alpha=False)
+                    npimg = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                    if pix.n == 4:
+                        img = cv2.cvtColor(npimg, cv2.COLOR_RGBA2BGR)
+                    elif pix.n == 3:
+                        img = cv2.cvtColor(npimg, cv2.COLOR_RGB2BGR)
+                    else:
+                        img = cv2.cvtColor(npimg, cv2.COLOR_GRAY2BGR)
+                except Exception as e:
+                    raise ValueError(f"Failed to render PDF: {e}")
+            else:
+                arr = np.frombuffer(data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None or img.size == 0:
+                raise ValueError("Failed to read image (unsupported format or corrupted file)")
+
+            # Use new backend: OMRGrader
+            key = st.session_state.answer_key_data
+            # Resolve set name strictly; error if missing
+            sel = st.session_state.answer_key_set
+            candidates = [sel, sel.upper(), sel.lower()]
+            if sel in ("A","B"):
+                candidates.extend([f"set_{1 if sel=='A' else 2}"])
+            elif str(sel).startswith("set_"):
+                if sel.endswith("1"): candidates.append("A")
+                if sel.endswith("2"): candidates.append("B")
+            set_name = next((c for c in candidates if c in key), None)
+            if not set_name:
+                raise ValueError(f"Selected key set '{sel}' not found. Provide it in answer_key.json or upload a key containing '{sel}' (or its alias).")
+            grader = engine.OMRGrader(key)
+            results = grader.grade(img, set_name=set_name, debug=False)
+
+            # Build review visuals (original, flattened, answer area, detected bubbles)
+            import tempfile
+            review = {}
+            def _safe_encode_png(arr):
+                try:
+                    if arr is None or getattr(arr, 'size', 0) == 0:
+                        return None
+                    ok, b = cv2.imencode('.png', arr)
+                    return b.tobytes() if ok else None
+                except Exception:
+                    return None
+            # Original
+            review['original'] = _safe_encode_png(img)
+            # Flattened (engine expects path) - use delete=False on Windows and close before reading
+            tmp_path = None
+            try:
+                tf = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                tf.write(cv2.imencode('.png', img)[1].tobytes())
+                tf.flush()
+                tmp_path = tf.name
+                tf.close()
+                flat = engine.flatten_image(tmp_path, show_steps=False)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            if flat is None or flat.size == 0:
+                flat = img.copy()
+            review['flattened'] = _safe_encode_png(flat)
+            # Answer area + bubbles
+            thresh, _zone = grader.detect_bubble_area(flat, show_steps=False)
+            # Recreate cleaned image crop to draw on
+            h, w = flat.shape[:2]
+            start_y = grader.detect_subject_headings(flat, thresh, show_steps=False)
+            top, bottom = max(0, min(h-2, int(start_y + 50))), max(2, min(h, int(h - 50)))
+            if bottom <= top:
+                top = 0; bottom = h
+            cleaned = flat[top:bottom, :].copy()
+            bubbles = grader.detect_bubbles(thresh, cleaned, show_steps=False)
+            dbg = cleaned.copy()
+            try:
+                cv2.drawContours(dbg, bubbles, -1, (0, 0, 255), 2)
+            except Exception:
+                pass
+            review['answer_area'] = _safe_encode_png(cleaned)
+            review['bubbles'] = _safe_encode_png(dbg)
+            st.session_state.review_images = review
+
+            # Prepare session result
             st.session_state.current_result = {
-                "student_id": res.student_id,
-                "subject_scores": res.subject_scores,
-                "total_score": res.total_score,
-                "evaluation_time": res.evaluation_time,
-                "confidence_score": res.confidence_score,
+                "student_id": f"UI-{hashlib.md5((st.session_state.uploaded_file.name if st.session_state.uploaded_file else os.path.basename(st.session_state.sample_image)).encode()).hexdigest()[:6].upper()}",
+                "subject_scores": results.get("subject_scores", {}),
+                "total_score": int((results.get("total_score", 0) / max(results.get("total_questions", 1),1)) * 100),
+                "evaluation_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "confidence_score": round(results.get("accuracy", 0.0), 2),
             }
-            st.session_state.current_overlay = res.annotated_image
+            st.session_state.detailed_results = results.get("detailed_results", [])
+            st.session_state.current_overlay = None
             # Persist to DB
             try:
                 db_id = db.save_result(
-                    student_id=res.student_id,
-                    subject_scores=res.subject_scores,
-                    total_score=res.total_score,
-                    evaluation_time_str=res.evaluation_time,
-                    confidence_score=res.confidence_score,
+                    student_id=st.session_state.current_result["student_id"],
+                    subject_scores=st.session_state.current_result["subject_scores"],
+                    total_score=st.session_state.current_result["total_score"],
+                    evaluation_time_str=st.session_state.current_result["evaluation_time"],
+                    confidence_score=st.session_state.current_result["confidence_score"],
                     key_set=st.session_state.key_set,
                     source_file=getattr(st.session_state.uploaded_file, 'name', None),
                 )
@@ -469,6 +745,7 @@ def evaluate_omr_sheet():
             st.error(f"Engine failed: {e}")
             st.session_state.current_result = None
             st.session_state.current_overlay = None
+            st.session_state.detailed_results = None
 
     st.success("Evaluation completed. Open the Results or Review tab.")
 
@@ -520,6 +797,23 @@ def results_tab():
     st.dataframe(df, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # Per-question side-by-side (if available)
+    if st.session_state.get('detailed_results'):
+        st.subheader("Per-question Details")
+        det_df = pd.DataFrame(st.session_state.detailed_results)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.dataframe(det_df, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Download CSV/JSON of detailed results
+        cdl1, cdl2 = st.columns(2)
+        with cdl1:
+            csv_buf = io.StringIO()
+            det_df.to_csv(csv_buf, index=False)
+            st.download_button("Download Per-question CSV", data=csv_buf.getvalue(), file_name="omr_side_by_side.csv", mime="text/csv", use_container_width=True)
+        with cdl2:
+            st.download_button("Download Per-question JSON", data=json.dumps(st.session_state.detailed_results, indent=2), file_name="omr_results.json", mime="application/json", use_container_width=True)
+
     # Export buttons
     exp_c1, exp_c2 = st.columns(2)
     with exp_c1:
@@ -539,15 +833,20 @@ def review_tab():
 
     c1, c2 = st.columns([3,1])
     with c1:
-        w = st.slider("Zoom width", min_value=400, max_value=900, value=720)
-        if st.session_state.current_overlay is not None:
-            st.image(st.session_state.current_overlay, caption="Engine-generated evaluation overlay", width=w)
-        else:
-            annotated_img = get_cached_annotated_image(st.session_state.current_result)
-            st.image(annotated_img, caption="System-generated evaluation overlay", width=w)
+        w = st.slider("Zoom width", min_value=400, max_value=1000, value=800)
+        imgs = st.session_state.get('review_images') or {}
+        tabs = st.tabs(["Original", "Flattened", "Answer Area", "Detected Bubbles"])
+        with tabs[0]:
+            if imgs.get('original'): st.image(imgs['original'], caption="Original Upload", width=w)
+        with tabs[1]:
+            if imgs.get('flattened'): st.image(imgs['flattened'], caption="Flattened / Deskewed", width=w)
+        with tabs[2]:
+            if imgs.get('answer_area'): st.image(imgs['answer_area'], caption="Cropped Answer Area", width=w)
+        with tabs[3]:
+            if imgs.get('bubbles'): st.image(imgs['bubbles'], caption="Detected Bubbles (debug)", width=w)
     with c2:
         st.markdown("**Legend**")
-        st.markdown("- Green: Correct\n- Red: Incorrect\n- Gray: Not Marked\n- Yellow: Flagged")
+        st.markdown("- Red contours: Detected bubbles\n- Use tabs to switch between steps")
 
     # Downloads
     st.markdown("---")
