@@ -8,8 +8,8 @@ pandas>=2.2.0
 Pillow>=10.4.0
 openpyxl>=3.1.5
 
-# Computer vision
-opencv-python>=4.10.0
+# Computer vision (use headless build for Streamlit Cloud/Linux)
+opencv-python-headless==4.11.0.86
 
 # Database
 SQLAlchemy>=2.0.30
