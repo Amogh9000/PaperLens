@@ -86,23 +86,9 @@ If you keep a setup script, you can automate environment creation/activation and
 ### 5. Download Results
 - **CSV** and **Excel**: Export detailed results
 
-##  Architecture
+##  Architecture 
 
-### Frontend
-- **Streamlit** (`app.py`) orchestrates the UI (Upload, Results, Review, Dashboard)
-- **Altair** for charts; **Pandas** drives tabular displays and exports
-
-### Engine (Backend Processing)
-- **OpenCV + NumPy** (`engine.py`) for perspective correction, thresholding, and bubble detection
-- **PyMuPDF (fitz)**: Renders first page of PDFs into images for processing
-- **Answer Keys**: Loaded from `answer_key.json` (top-level `set_1` and `set_2`) or Excel
-
-### Data Flow (High level)
-1. Upload image/PDF → image decoded (or rendered)
-2. `engine.flatten_image(path)` to deskew/flatten
-3. Detect answer area and bubbles; group bubbles into questions
-4. Grade against selected set’s key
-5. Return results + review visuals to the UI
+<img width="600" height="548" alt="Image" src="https://github.com/user-attachments/assets/ff88ffcc-a2b2-4489-8cac-5cc9cca1ae12" />
 
 ## Project Structure
 
